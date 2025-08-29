@@ -49,8 +49,6 @@ seaborn==0.13.2
 
    - Run the main script to start training:
 
-     Bash
-
      ```
      python main.py --dataset_name [dataset_name] --eval_scenario [scenario]
      ```
