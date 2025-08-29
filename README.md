@@ -40,9 +40,9 @@ seaborn==0.13.2
    - Preprocess the data:
 
      ```
-  python main.py --preprocess --dataset_name [dataset_name]
+     python main.py --preprocess --dataset_name [dataset_name]
      ```
-     
+
      Replace `[dataset_name]` with `ml-100k` or `last.fm`.
 
 2. **Train the Model**
