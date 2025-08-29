@@ -1,6 +1,6 @@
 # MetaDSM Recommendation Model
 
-This is the official source code for the paper "Integrating Static and Dynamic Preferences via Meta-Learning for User Cold Start Recommendation".
+This is the source code for the paper "Integrating Static and Dynamic Preferences via Meta-Learning for User Cold Start Recommendation".
 
 ## Key Features
 
