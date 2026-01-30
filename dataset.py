@@ -6,72 +6,87 @@ import scipy.sparse as sp
 import os
 from tqdm import tqdm
 import pickle
-from sklearn.preprocessing import normalize
+
 
 def preprocess_data(config):
     item_genre_features = None
-    if config.dataset_name == 'ml-100k':
-        df = pd.read_csv(os.path.join(config.raw_data_path, 'u.data'), sep='\t', header=None,
-                         names=['user_id', 'item_id', 'rating', 'timestamp'])
-        df['user_id'] -= 1
-        df['item_id'] -= 1
-        num_items = df['item_id'].max() + 1
-        item_genre_features = np.zeros((num_items, 19), dtype=np.float32)
-        item_meta_path = os.path.join(config.raw_data_path, 'u.item')
-        if os.path.exists(item_meta_path):
-            meta_df = pd.read_csv(item_meta_path, sep='|', header=None, index_col=0, encoding='latin-1')
-            genre_df = meta_df.iloc[:, 4:23]
-            for item_id, row in genre_df.iterrows():
-                if (item_id - 1) < num_items:
-                    item_genre_features[item_id - 1] = row.values
+    if config.dataset_name == 'ML-1M':
+        df = pd.read_csv(os.path.join(config.raw_data_path, 'ratings.dat'), sep='::', header=None,
+                         names=['user_id', 'item_id', 'rating', 'timestamp'], engine='python', encoding='latin-1')
 
-    elif config.dataset_name == 'last.fm':
-        main_df = pd.read_csv(os.path.join(config.raw_data_path, 'user_artists.dat'), sep='\t', header=0,
-                              names=['user_id', 'item_id', 'weight'])
-        user_mapping = {old_id: new_id for new_id, old_id in enumerate(main_df['user_id'].unique())}
-        item_mapping = {old_id: new_id for new_id, old_id in enumerate(main_df['item_id'].unique())}
-
-        timestamps_path = os.path.join(config.raw_data_path, 'user_taggedartists-timestamps.dat')
-        df = pd.read_csv(timestamps_path, sep='\t', header=0, names=['user_id', 'item_id', 'tag_id', 'timestamp'])
-
-        df = df[df['user_id'].isin(user_mapping.keys()) & df['item_id'].isin(item_mapping.keys())]
-        df = df.sort_values(by=['user_id', 'timestamp']).reset_index(drop=True)
-
-        df.drop_duplicates(subset=['user_id', 'item_id', 'timestamp'], keep='first', inplace=True)
-
-        df['prev_item_id'] = df.groupby('user_id')['item_id'].shift(1)
-        df = df[df['item_id'] != df['prev_item_id']]
-        df = df[['user_id', 'item_id', 'timestamp']]
+        user_mapping = {old_id: new_id for new_id, old_id in enumerate(df['user_id'].unique())}
+        item_mapping = {old_id: new_id for new_id, old_id in enumerate(df['item_id'].unique())}
 
         df['user_id'] = df['user_id'].map(user_mapping)
         df['item_id'] = df['item_id'].map(item_mapping)
 
         num_items = len(item_mapping)
-        tags_path = os.path.join(config.raw_data_path, 'tags.dat')
-        user_tagged_path = os.path.join(config.raw_data_path, 'user_taggedartists.dat')
 
-        if os.path.exists(tags_path) and os.path.exists(user_tagged_path):
-            tags_df = pd.read_csv(tags_path, sep='\t', header=0, names=['tagID', 'tagValue'], encoding='latin-1')
-            tag_mapping = {tag_id: i for i, tag_id in enumerate(tags_df['tagID'].unique())}
-            num_tags = len(tag_mapping)
-            tagged_artists_df = pd.read_csv(user_tagged_path, sep='\t', header=0,
-                                            names=['userID', 'artistID', 'tagID'], encoding='latin-1')
-            tagged_artists_df = tagged_artists_df[
-                tagged_artists_df['artistID'].isin(item_mapping) & tagged_artists_df['tagID'].isin(tag_mapping)]
-            tagged_artists_df['mapped_item_id'] = tagged_artists_df['artistID'].map(item_mapping)
-            tagged_artists_df['mapped_tag_idx'] = tagged_artists_df['tagID'].map(tag_mapping)
+        movies_path = os.path.join(config.raw_data_path, 'movies.dat')
+        if os.path.exists(movies_path):
+            movies_df = pd.read_csv(movies_path, sep='::', header=None, names=['item_id', 'title', 'genres'],
+                                    engine='python', encoding='latin-1')
+            movies_df = movies_df[movies_df['item_id'].isin(item_mapping.keys())]
+            movies_df['mapped_item_id'] = movies_df['item_id'].map(item_mapping)
 
-            tag_counts = tagged_artists_df.groupby(['mapped_item_id', 'mapped_tag_idx']).size().reset_index(
-                name='counts')
+            all_genres = set()
+            for genres in movies_df['genres']:
+                all_genres.update(genres.split('|'))
+            genre_map = {genre: i for i, genre in enumerate(sorted(list(all_genres)))}
+            num_genres = len(genre_map)
 
-            item_indices = tag_counts['mapped_item_id'].values
-            tag_indices = tag_counts['mapped_tag_idx'].values
-            counts = tag_counts['counts'].values
+            item_genre_features = np.zeros((num_items, num_genres), dtype=np.float32)
+            for _, row in movies_df.iterrows():
+                mid = row['mapped_item_id']
+                genres = row['genres'].split('|')
+                for genre in genres:
+                    if genre in genre_map:
+                        item_genre_features[mid, genre_map[genre]] = 1.0
 
-            item_genre_features = sp.csr_matrix((counts, (item_indices, tag_indices)),
-                                                shape=(num_items, num_tags),
-                                                dtype=np.float32)
-            item_genre_features = normalize(item_genre_features, norm='l2', axis=1)
+    elif config.dataset_name == 'BX':
+        ratings_path = os.path.join(config.raw_data_path, 'Ratings.csv')
+
+        df = pd.read_csv(
+            ratings_path,
+            sep=',',
+            header=0,
+            encoding='latin-1',
+            on_bad_lines='skip'
+
+        )
+
+        df = df.rename(columns={
+            'User-ID': 'user_id',
+            'ISBN': 'item_id',
+            'Book-Rating': 'rating'
+
+        })
+
+        if 'user_id' not in df.columns:
+            df = df.iloc[:, :3]
+            df.columns = ['user_id', 'item_id', 'rating']
+
+        df['user_id'] = pd.to_numeric(df['user_id'], errors='coerce')
+        df['rating'] = pd.to_numeric(df['rating'], errors='coerce')
+        df = df.dropna(subset=['user_id', 'item_id', 'rating'])
+        df['user_id'] = df['user_id'].astype(int)
+
+        user_mapping = {
+            old_id: new_id
+            for new_id, old_id in enumerate(df['user_id'].unique())
+
+        }
+        item_mapping = {
+            old_id: new_id
+            for new_id, old_id in enumerate(df['item_id'].unique())
+        }
+
+        df['user_id'] = df['user_id'].map(user_mapping)
+        df['item_id'] = df['item_id'].map(item_mapping)
+
+        df['timestamp'] = np.arange(len(df))
+
+        num_items = len(item_mapping)
 
     else:
         raise ValueError(f"Unsupported dataset: {config.dataset_name}")
@@ -211,6 +226,7 @@ def preprocess_data(config):
     with open(meta_path, 'wb') as f:
         pickle.dump(meta_info, f)
 
+
 class MetaTaskDataset(Dataset):
     def __init__(self, tasks_data, config):
         self.config = config
@@ -235,6 +251,7 @@ class MetaTaskDataset(Dataset):
             item['neg_items'] = torch.LongTensor(task_data['neg_items'])
         return item
 
+
 class PretrainDataset(Dataset):
     def __init__(self, interaction_matrix):
         self.users = interaction_matrix.row
@@ -245,6 +262,7 @@ class PretrainDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.users[idx], self.pos_items[idx]
+
 
 def meta_collate_fn(batch):
     batch = [b for b in batch if b is not None]
@@ -259,6 +277,7 @@ def meta_collate_fn(batch):
             tensors = [d[key] for d in batch]
             collated_batch[key] = torch.stack(tensors, 0)
     return collated_batch
+
 
 def load_data(config):
     processed_base_path = os.path.join(config.processed_data_path, config.dataset_name, config.eval_scenario)
@@ -279,7 +298,13 @@ def load_data(config):
     train_tasks_data = torch.load(train_task_path, weights_only=False)
     test_tasks_data = torch.load(test_task_path, weights_only=False)
     interaction_matrix = sp.load_npz(interaction_matrix_path)
-    
+    pop_sampler = None
+    if config.ablation_mode == 'baseline_GRU4Rec':
+        pop = np.array(interaction_matrix.sum(axis=0)).flatten()
+        pop = pop ** config.gru4rec_sample_alpha
+        pop_cs = pop.cumsum()
+        pop_cs /= pop_cs[-1]
+        pop_sampler = (pop, pop_cs)
     train_dataset = MetaTaskDataset(train_tasks_data, config)
     test_dataset = MetaTaskDataset(test_tasks_data, config)
     pretrain_dataset = PretrainDataset(interaction_matrix.tocoo())
@@ -311,4 +336,4 @@ def load_data(config):
     print(f"Users: {config.num_users}, Items: {config.num_items}")
     print(f"Train tasks: {len(train_dataset)}, Test tasks: {len(test_dataset)}")
     print("-" * 50)
-    return train_loader, test_loader, pretrain_loader, interaction_matrix, item_genre_features
+    return train_loader, test_loader, pretrain_loader, interaction_matrix, pop_sampler, item_genre_features
