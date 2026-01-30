@@ -6,31 +6,51 @@ import numpy as np
 from utils import recall_at_k, ndcg_at_k, EMA, to_device
 import os
 import json
-import matplotlib.pyplot as plt
+
 
 class Trainer:
-    def __init__(self, config, model, train_loader, test_loader, pretrain_loader):
+    def __init__(self, config, model, train_loader, test_loader, pretrain_loader, pop_sampler=None):
         self.config = config
         self.model = model.to(config.device)
-        if hasattr(torch, 'compile') and torch.__version__.startswith('2'):
-            self.model = torch.compile(self.model)
         self.train_loader = train_loader
         self.test_loader = test_loader
         self.pretrain_loader = pretrain_loader
+        self.pop_sampler = pop_sampler
         params = []
-        params.append({'params': self.model.light_gcn.parameters(), 'lr': config.meta_gcn_lr})
-        params.append({'params': self.model.gru.parameters(), 'lr': config.meta_lr})
-        if hasattr(self.model, 'fusion_mlp') and self.model.fusion_mlp is not None:
-            params.append({'params': self.model.fusion_mlp.parameters(), 'lr': config.meta_lr})
-        if hasattr(self.model, 'predictor') and self.model.predictor is not None:
-            params.append({'params': self.model.predictor.parameters(), 'lr': config.meta_lr})
-        if hasattr(self.model, 'feature_projector'):
-            params.append({'params': self.model.feature_projector.parameters(), 'lr': config.meta_lr})
+        mode = self.config.ablation_mode
+
+        if "baseline" in mode:
+            lr = config.pretrain_lr
+            if mode in ['baseline_MeLU', 'baseline_MAMO', 'baseline_TDAS', 'baseline_TaNP']:
+                lr = config.meta_lr
+            params.append({'params': self.model.parameters(), 'lr': lr})
+        else:
+            if self.model.use_gcn:
+                params.append({'params': self.model.light_gcn.parameters(), 'lr': config.meta_gcn_lr})
+            else:
+                params.append({'params': self.model.user_embedding.parameters(), 'lr': config.meta_lr})
+                params.append({'params': self.model.item_embedding.parameters(), 'lr': config.meta_lr})
+            if self.model.use_gru:
+                params.append({'params': self.model.gru.parameters(), 'lr': config.meta_lr})
+            if hasattr(self.model, 'static_predictor'):
+                params.append({'params': self.model.static_predictor.parameters(), 'lr': config.meta_lr})
+            if hasattr(self.model, 'dynamic_predictor'):
+                params.append({'params': self.model.dynamic_predictor.parameters(), 'lr': config.meta_lr})
+            if hasattr(self.model, 'interaction_predictor'):
+                params.append({'params': self.model.interaction_predictor.parameters(), 'lr': config.meta_lr})
+            if hasattr(self.model, 'gating_network'):
+                params.append({'params': self.model.gating_network.parameters(), 'lr': config.meta_lr})
+            if hasattr(self.model, 'feature_projector'):
+                params.append({'params': self.model.feature_projector.parameters(), 'lr': config.meta_lr})
 
         self.optimizer = torch.optim.AdamW(params, weight_decay=config.weight_decay)
 
-        num_training_steps = self.config.num_epochs * len(self.train_loader)
-        num_warmup_steps = self.config.warmup_epochs * len(self.train_loader)
+        if mode == 'baseline_LightGCN':
+            num_training_steps = self.config.pretrain_epochs * len(self.pretrain_loader)
+            num_warmup_steps = self.config.warmup_epochs * len(self.pretrain_loader)
+        else:
+            num_training_steps = self.config.num_epochs * len(self.train_loader)
+            num_warmup_steps = self.config.warmup_epochs * len(self.train_loader)
 
         def lr_lambda(current_step):
             if current_step < num_warmup_steps:
@@ -41,7 +61,7 @@ class Trainer:
 
         self.scheduler = LambdaLR(self.optimizer, lr_lambda)
 
-        self.use_ema = True
+        self.use_ema = "baseline" not in mode
         if self.use_ema:
             self.ema = EMA(self.model, decay=config.ema_decay)
 
@@ -50,19 +70,31 @@ class Trainer:
             self.history[f'recall@{k}'] = []
             self.history[f'ndcg@{k}'] = []
 
-        self.output_dir = f'results/{self.config.dataset_name}_full_{self.config.eval_scenario}'
+        run_name = f"{config.ablation_mode}"
+        if config.ablation_mode == 'full':
+            if config.fusion_ablation != 'full':
+                run_name += f"_{config.fusion_ablation}"
+            if config.inner_loop_mode != 'step_by_step':
+                run_name += f"_{config.inner_loop_mode}"
+
+        if config.support_size != 10:
+            run_name += f"_k{config.support_size}"
+
+        if config.seed != 2025:
+            run_name += f"_seed{config.seed}"
+
+        self.output_dir = os.path.join('results', config.dataset_name, config.eval_scenario, run_name)
         os.makedirs(self.output_dir, exist_ok=True)
 
     def _pretrain_gcn(self):
-        if self.model.light_gcn is None:
+        if not hasattr(self.model, 'light_gcn') or self.model.light_gcn is None:
             return
         gcn_optim = torch.optim.Adam(self.model.light_gcn.parameters(), lr=self.config.pretrain_lr)
         for epoch in tqdm(range(1, self.config.pretrain_epochs + 1), desc="Pre-training"):
             self.model.train()
             total_loss = 0.0
             for users, pos_items in self.pretrain_loader:
-                users = users.to(self.config.device)
-                pos_items = pos_items.to(self.config.device)
+                users, pos_items = users.to(self.config.device), pos_items.to(self.config.device)
                 neg_items = torch.randint(0, self.config.num_items, (len(users),), device=self.config.device)
                 collisions = (neg_items == pos_items)
                 while torch.any(collisions):
@@ -78,35 +110,65 @@ class Trainer:
                 total_loss += loss.item()
 
     def train(self):
-        self._pretrain_gcn()
+        if "baseline" not in self.config.ablation_mode:
+            self._pretrain_gcn()
+
         for epoch in tqdm(range(1, self.config.num_epochs + 1), desc="Training"):
             avg_train_loss = self._train_epoch()
             if avg_train_loss is not None:
                 self.history['train_loss'].append(avg_train_loss)
             self.history['epochs'].append(epoch)
-            self._evaluate_test_set()
-        
-        final_model_path = os.path.join(self.output_dir, 'final_model.pth')
-        torch.save(self.model.state_dict(), final_model_path)
+            self._evaluate_test_set(epoch)
+        if self.config.ablation_mode == 'full':
+            final_model_path = os.path.join(self.output_dir, 'final_model.pth')
+            torch.save(self.model.state_dict(), final_model_path)
         self._save_history_to_json()
         self._save_history_summary_txt()
-        self._plot_history()
 
     def _train_epoch(self):
         self.model.train()
         total_loss = 0.0
         num_batches = 0
-        loader = self.train_loader
+        mode = self.config.ablation_mode
+        loader = self.pretrain_loader if mode == 'baseline_LightGCN' else self.train_loader
         for batch in loader:
             if batch is None: continue
             self.optimizer.zero_grad()
-            batch = to_device(batch, self.config.device)
-            loss = self.model.forward_meta(batch)
+            loss = None
+
+            if mode == 'baseline_LightGCN':
+                users, pos_items = to_device(batch, self.config.device)
+                neg_items = torch.randint(0, self.config.num_items, (len(users),), device=self.config.device)
+                loss = self.model.forward(users, pos_items, neg_items)
+            elif mode == 'baseline_GRU4Rec':
+                batch = to_device(batch, self.config.device)
+                if self.pop_sampler is None:
+                    raise ValueError("Popularity sampler is required for GRU4Rec baseline.")
+                pos_items = batch['query_item'].squeeze(1)
+                batch_size = pos_items.size(0)
+                random_values = torch.rand(batch_size, self.config.gru4rec_n_sample, device=self.config.device)
+                neg_items = torch.searchsorted(torch.from_numpy(self.pop_sampler[1]).to(self.config.device),
+                                               random_values)
+                bpr_batch = {'support_seq': batch['support_seq'], 'pos_items': pos_items, 'neg_items': neg_items}
+                loss = self.model.forward(bpr_batch)
+            elif mode in ['baseline_MeLU', 'baseline_FMLPRec', 'baseline_SASRec', 'baseline_MAMO', 'baseline_TDAS',
+                          'baseline_TaNP']:
+                batch = to_device(batch, self.config.device)
+                loss = self.model.forward(batch)
+            else:
+                batch = to_device(batch, self.config.device)
+                if self.model.use_meta:
+                    loss = self.model.forward_meta(batch)
+                else:
+                    loss = self.model.forward_no_meta(batch)
 
             if loss is None or torch.isnan(loss):
                 continue
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.outer_grad_clip)
+            if mode == 'baseline_LightGCN':
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.outer_grad_clip)
             self.optimizer.step()
             if self.scheduler:
                 self.scheduler.step()
@@ -116,33 +178,51 @@ class Trainer:
             num_batches += 1
         return total_loss / num_batches if num_batches > 0 else None
 
-    def _evaluate_test_set(self):
+    def _evaluate_test_set(self, epoch=0):
         if self.use_ema: self.ema.apply_shadow()
         self.model.eval()
         k_list = self.config.eval_k_list
         all_recalls = {k: [] for k in k_list}
         all_ndcgs = {k: [] for k in k_list}
+        mode = self.config.ablation_mode
 
-        gcn_user_emb, gcn_item_emb = None, None
-        with torch.no_grad():
-            gcn_user_emb, gcn_item_emb = self.model._get_base_embeddings()
+        saved_weights = []
+        save_weights_flag = (epoch == self.config.num_epochs) and ("baseline" not in mode)
 
         try:
-            for batch in self.test_loader:
+            for batch_idx, batch in enumerate(self.test_loader):
                 if batch is None or batch['query_item'].numel() == 0: continue
-
                 batch = to_device(batch, self.config.device)
-                neg_items = batch['neg_items']
-                scores = self.model.evaluate_batch(batch, gcn_user_emb, gcn_item_emb)
-                eval_items = torch.cat([batch['query_item'], neg_items], dim=1)
 
+                scores = None
+                weights = None
+
+                if "baseline" in mode:
+                    scores = self.model.evaluate_batch(batch)
+                else:
+                    need_weights = save_weights_flag and (batch_idx == 0)
+                    if self.model.use_meta:
+                        res = self.model.evaluate_batch(batch, return_weights=need_weights)
+                    else:
+                        res = self.model.evaluate_batch_no_meta(batch, return_weights=need_weights)
+
+                    if need_weights:
+                        scores, weights = res
+                        if weights is not None:
+                            pos_weights = weights[:, 0].squeeze().cpu().tolist()
+                            user_ids = batch['user_id'].cpu().tolist()
+                            for uid, w in zip(user_ids, pos_weights):
+                                saved_weights.append({'user_id': uid, 'fusion_weight': w})
+                    else:
+                        scores = res
+
+                eval_items = torch.cat([batch['query_item'], batch['neg_items']], dim=1)
                 max_k = max(k_list)
                 _, top_indices = torch.topk(scores, k=min(max_k, scores.size(1)))
 
                 for i in range(scores.size(0)):
                     true_item = batch['query_item'][i].item()
                     top_items_for_user = eval_items[i][top_indices[i]].cpu()
-
                     for k in k_list:
                         top_k = top_items_for_user[:k]
                         all_recalls[k].append(recall_at_k(top_k, true_item))
@@ -156,6 +236,11 @@ class Trainer:
                 avg_ndcg = np.mean(all_ndcgs[k])
                 self.history[f'recall@{k}'].append(avg_recall)
                 self.history[f'ndcg@{k}'].append(avg_ndcg)
+
+        if saved_weights:
+            weight_path = os.path.join(self.output_dir, 'case_study_weights.json')
+            with open(weight_path, 'w') as f:
+                json.dump(saved_weights, f, indent=4)
 
     def _save_history_to_json(self):
         history_path = os.path.join(self.output_dir, 'training_history.json')
@@ -178,35 +263,3 @@ class Trainer:
                         best_ndcg_epoch = self.history['epochs'][best_ndcg_idx]
                         best_ndcg = self.history[f'ndcg@{k}'][best_ndcg_idx]
                         f.write(f"Best NDCG@{k}: {best_ndcg:.4f} (at epoch {best_ndcg_epoch})\n")
-    
-    def _plot_history(self):
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 6))
-        
-        if self.history['train_loss']:
-            ax1.plot(self.history['epochs'], self.history['train_loss'], label='Training Loss', color='tab:red')
-        ax1.set_xlabel('Epochs')
-        ax1.set_ylabel('Loss')
-        ax1.set_title('Training Loss Over Epochs')
-        ax1.legend()
-        ax1.grid(True)
-        
-        colors = plt.cm.viridis(np.linspace(0, 1, len(self.config.eval_k_list) * 2))
-        color_idx = 0
-        for k in self.config.eval_k_list:
-            if self.history[f'recall@{k}']:
-                ax2.plot(self.history['epochs'], self.history[f'recall@{k}'], label=f'Recall@{k}', linestyle='-', color=colors[color_idx])
-                color_idx += 1
-            if self.history[f'ndcg@{k}']:
-                ax2.plot(self.history['epochs'], self.history[f'ndcg@{k}'], label=f'NDCG@{k}', linestyle='--', color=colors[color_idx])
-                color_idx += 1
-        
-        ax2.set_xlabel('Epochs')
-        ax2.set_ylabel('Metric Value')
-        ax2.set_title('Evaluation Metrics Over Epochs')
-        ax2.legend()
-        ax2.grid(True)
-        
-        plt.tight_layout()
-        plot_path = os.path.join(self.output_dir, 'training_curves.pdf')
-        plt.savefig(plot_path, format='pdf')
-        plt.close()
