@@ -18,6 +18,7 @@ def to_device(data, device):
         return data.to(device)
     return data
 
+
 class EMA:
     def __init__(self, model, decay):
         self.model = model
@@ -51,6 +52,7 @@ class EMA:
                 assert name in self.backup
                 param.data = self.backup[name]
         self.backup = {}
+
 
 @torch.no_grad()
 def recall_at_k(top_k_items, true_item):
