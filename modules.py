@@ -3,6 +3,7 @@ import torch.nn as nn
 import scipy.sparse as sp
 import numpy as np
 
+
 class LightGCN(nn.Module):
     def __init__(self, num_users, num_items, embedding_dim, interaction_matrix, num_layers=2):
         super(LightGCN, self).__init__()
