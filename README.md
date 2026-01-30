@@ -4,7 +4,7 @@ This is the source code for the paper "Integrating Static and Dynamic Preference
 
 ## Key Features
 
-- **Meta-Learning Framework**: Utilizes MAML (Model-Agnostic Meta-Learning) to quickly adapt to new users using limited interaction support sets.
+- **Meta-Learning Framework**: Utilizes MAML to quickly adapt to new users using limited interaction support sets.
 - **Hybrid Preference Modeling**:
   - **Static**: Uses **LightGCN** to capture long-term user/item representations from the global interaction graph.
   - **Dynamic**: Uses **GRU** to capture short-term sequential patterns from recent interactions.
